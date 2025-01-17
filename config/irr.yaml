@@ -12,17 +12,31 @@ sessions:
     envVarPrefix: binance
 
 exchangeStrategies:
-- on: binance
-  irr:
-    symbol: BTCUSDT
-    interval: 1m
-    window: 10
-    amount: 5000
-    # Draw pnl
-    drawGraph: true
-    graphPNLPath: "./pnl.png"
-    graphCumPNLPath: "./cumpnl.png"
+  - on: binance
+    irr:
+      symbol: BTCUSDT
+      interval: 1m
+      window: 10
+      amount: 5000
 
+      # 限价单价差设置
+      bidSpread: 0.0001 # 买入价差 0.01%
+      askSpread: 0.0001 # 卖出价差 0.01%
+
+      # 止盈止损设置
+      stopLoss: 0.02 # 止损比例 2%
+      takeProfit: 0.03 # 止盈比例 3%
+      trailingStop: true # 启用追踪止损
+
+      # 风险管理参数
+      maxDrawdown: 0.1 # 最大回撤限制 10%
+      dailyLossLimit: 0.05 # 每日亏损限制 5%
+      positionSizeLimit: 0.5 # 最大仓位限制 50%
+
+      # 绘图设置
+      drawGraph: true
+      graphPNLPath: "./pnl.png"
+      graphCumPNLPath: "./cumpnl.png"
 
 backtest:
   startTime: "2022-01-01"
@@ -30,11 +44,10 @@ backtest:
   symbols:
     - BTCUSDT
   sessions: [binance]
-#  syncSecKLines: true
   accounts:
     binance:
-      makerFeeRate: 0.0000
-      takerFeeRate: 0.0000
+      makerFeeRate: 0.0001 # maker 费率 0.01%
+      takerFeeRate: 0.0002 # taker 费率 0.02%
       balances:
         BTC: 0.0
         USDT: 5000

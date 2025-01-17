@@ -77,6 +77,16 @@ type Strategy struct {
 
 	// 卖出价格比当前价格高的比例
 	AskSpread fixedpoint.Value `json:"askSpread"`
+
+	// 止盈止损设置
+	StopLoss     fixedpoint.Value `json:"stopLoss"`     // 止损比例
+	TakeProfit   fixedpoint.Value `json:"takeProfit"`   // 止盈比例
+	TrailingStop bool             `json:"trailingStop"` // 是否启用追踪止损
+
+	// 风险管理参数
+	MaxDrawdown       fixedpoint.Value `json:"maxDrawdown"`       // 最大回撤限制
+	DailyLossLimit    fixedpoint.Value `json:"dailyLossLimit"`    // 每日亏损限制
+	PositionSizeLimit fixedpoint.Value `json:"positionSizeLimit"` // 最大仓位限制
 }
 
 // AccumulatedProfitReport For accumulated profit report output
@@ -352,7 +362,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		alphaNrr := fixedpoint.NewFromFloat(s.nrr.RankedValues.Index(1))
 
 		// alpha-weighted inventory and cash
-		targetBase := s.QuantityOrAmount.CalculateQuantity(kline.Close).Mul(alphaNrr)
+		targetBase := s.calculatePosition(kline, alphaNrr)
 		diffQty := targetBase.Sub(s.Position.Base)
 		log.Info(alphaNrr.Float64(), s.Position.Base, diffQty.Float64())
 
@@ -402,31 +412,74 @@ func (s *Strategy) CalcAssetValue(price fixedpoint.Value) fixedpoint.Value {
 }
 
 func (s *Strategy) placeOrders(ctx context.Context, diffQty fixedpoint.Value, kline types.KLine) {
+	// 根据市场深度动态调整价差
+	orderBook := s.session.MarketDataStream.GetBook()
+	spread := calculateDynamicSpread(orderBook)
+
 	if diffQty.Sign() > 0 {
-		// 买入时使用比当前价格低一点的限价单
-		currentPrice := kline.Close
-		bidPrice := currentPrice.Mul(fixedpoint.One.Sub(s.BidSpread))
-
-		_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
-			Symbol:   s.Symbol,
-			Side:     types.SideTypeBuy,
-			Type:     types.OrderTypeLimitMaker,
-			Quantity: diffQty.Abs(),
-			Price:    bidPrice,
-			Tag:      "irrBuy",
-		})
+		// 分批买入，避免冲击市场
+		chunks := splitOrderIntoChunks(diffQty, 3) // 将订单分成3份
+		for _, qty := range chunks {
+			bidPrice := kline.Close.Mul(fixedpoint.One.Sub(spread))
+			// ... 下单逻辑
+		}
 	} else if diffQty.Sign() < 0 {
-		// 卖出时使用比当前价格高一点的限价单
-		currentPrice := kline.Close
-		askPrice := currentPrice.Mul(fixedpoint.One.Add(s.AskSpread))
-
-		_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
-			Symbol:   s.Symbol,
-			Side:     types.SideTypeSell,
-			Type:     types.OrderTypeLimitMaker,
-			Quantity: diffQty.Abs(),
-			Price:    askPrice,
-			Tag:      "irrSell",
-		})
+		// 分批卖出
+		chunks := splitOrderIntoChunks(diffQty.Abs(), 3)
+		for _, qty := range chunks {
+			askPrice := kline.Close.Mul(fixedpoint.One.Add(spread))
+			// ... 下单逻辑
+		}
 	}
+}
+
+func (s *Strategy) calculatePosition(kline types.KLine, alphaNrr fixedpoint.Value) fixedpoint.Value {
+	// 基础仓位
+	basePosition := s.QuantityOrAmount.CalculateQuantity(kline.Close)
+
+	// 根据趋势强度调整仓位
+	trendStrength := calculateTrendStrength() // 计算趋势强度
+
+	// 根据波动率调整仓位
+	volatility := calculateVolatility() // 计算波动率
+
+	// 动态调整最终仓位
+	targetBase := basePosition.Mul(alphaNrr).
+		Mul(fixedpoint.NewFromFloat(trendStrength)).
+		Mul(fixedpoint.NewFromFloat(volatility))
+
+	return targetBase
+}
+
+func (s *Strategy) checkStopPrice(ctx context.Context, currentPrice fixedpoint.Value) {
+	if s.Position.IsLong() {
+		// 止损价格
+		stopPrice := s.Position.AverageCost.Mul(fixedpoint.One.Sub(s.StopLoss))
+		if currentPrice.Compare(stopPrice) <= 0 {
+			_ = s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
+			return
+		}
+
+		// 止盈价格
+		profitPrice := s.Position.AverageCost.Mul(fixedpoint.One.Add(s.TakeProfit))
+		if currentPrice.Compare(profitPrice) >= 0 {
+			_ = s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
+			return
+		}
+	}
+	// 做空方向类似...
+}
+
+func (s *Strategy) checkRiskLimits() bool {
+	// 检查回撤
+	if s.calculateDrawdown() > s.MaxDrawdown {
+		return false
+	}
+
+	// 检查每日亏损
+	if s.calculateDailyPnL() < s.DailyLossLimit.Neg() {
+		return false
+	}
+
+	return true
 }
