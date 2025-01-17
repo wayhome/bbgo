@@ -71,6 +71,12 @@ type Strategy struct {
 
 	// Accumulated profit report
 	AccumulatedProfitReport *AccumulatedProfitReport `json:"accumulatedProfitReport"`
+
+	// 买入价格比当前价格低的比例
+	BidSpread fixedpoint.Value `json:"bidSpread"`
+
+	// 卖出价格比当前价格高的比例
+	AskSpread fixedpoint.Value `json:"askSpread"`
 }
 
 // AccumulatedProfitReport For accumulated profit report output
@@ -355,23 +361,20 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		}
 
 		if diffQty.Sign() > 0 {
-			_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
-				Symbol:   s.Symbol,
-				Side:     types.SideTypeBuy,
-				Quantity: diffQty.Abs(),
-				Type:     types.OrderTypeMarket,
-				Tag:      "irrBuy",
-			})
+			s.placeOrders(ctx, diffQty, kline)
 		} else if diffQty.Sign() < 0 {
-			_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
-				Symbol:   s.Symbol,
-				Side:     types.SideTypeSell,
-				Quantity: diffQty.Abs(),
-				Type:     types.OrderTypeMarket,
-				Tag:      "irrSell",
-			})
+			s.placeOrders(ctx, diffQty, kline)
 		}
 	}))
+
+	// 设置默认价差
+	if s.BidSpread.IsZero() {
+		s.BidSpread = fixedpoint.NewFromFloat(0.0001)
+	}
+
+	if s.AskSpread.IsZero() {
+		s.AskSpread = fixedpoint.NewFromFloat(0.0001)
+	}
 
 	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
@@ -396,4 +399,34 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 func (s *Strategy) CalcAssetValue(price fixedpoint.Value) fixedpoint.Value {
 	balances := s.session.GetAccount().Balances()
 	return balances[s.Market.BaseCurrency].Total().Mul(price).Add(balances[s.Market.QuoteCurrency].Total())
+}
+
+func (s *Strategy) placeOrders(ctx context.Context, diffQty fixedpoint.Value, kline types.KLine) {
+	if diffQty.Sign() > 0 {
+		// 买入时使用比当前价格低一点的限价单
+		currentPrice := kline.Close
+		bidPrice := currentPrice.Mul(fixedpoint.One.Sub(s.BidSpread))
+
+		_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+			Symbol:   s.Symbol,
+			Side:     types.SideTypeBuy,
+			Type:     types.OrderTypeLimitMaker,
+			Quantity: diffQty.Abs(),
+			Price:    bidPrice,
+			Tag:      "irrBuy",
+		})
+	} else if diffQty.Sign() < 0 {
+		// 卖出时使用比当前价格高一点的限价单
+		currentPrice := kline.Close
+		askPrice := currentPrice.Mul(fixedpoint.One.Add(s.AskSpread))
+
+		_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+			Symbol:   s.Symbol,
+			Side:     types.SideTypeSell,
+			Type:     types.OrderTypeLimitMaker,
+			Quantity: diffQty.Abs(),
+			Price:    askPrice,
+			Tag:      "irrSell",
+		})
+	}
 }
