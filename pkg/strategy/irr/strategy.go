@@ -78,15 +78,16 @@ type Strategy struct {
 	// 卖出价格比当前价格高的比例
 	AskSpread fixedpoint.Value `json:"askSpread"`
 
-	// 止盈止损设置
-	StopLoss     fixedpoint.Value `json:"stopLoss"`     // 止损比例
-	TakeProfit   fixedpoint.Value `json:"takeProfit"`   // 止盈比例
-	TrailingStop bool             `json:"trailingStop"` // 是否启用追踪止损
+	MinSpread            fixedpoint.Value `json:"minSpread"`            // 最小价差
+	MaxSpread            fixedpoint.Value `json:"maxSpread"`            // 最大价差
+	VolatilityAdjustment bool             `json:"volatilityAdjustment"` // 是否根据波动率调整价差
 
-	// 风险管理参数
-	MaxDrawdown       fixedpoint.Value `json:"maxDrawdown"`       // 最大回撤限制
-	DailyLossLimit    fixedpoint.Value `json:"dailyLossLimit"`    // 每日亏损限制
-	PositionSizeLimit fixedpoint.Value `json:"positionSizeLimit"` // 最大仓位限制
+	StopLossPercentage fixedpoint.Value `json:"stopLossPercentage"`
+
+	MaxPositionSize fixedpoint.Value `json:"maxPositionSize"`
+	PositionScaling bool             `json:"positionScaling"` // 是否启用仓位缩放
+
+	TakeProfitPercentage fixedpoint.Value `json:"takeProfitPercentage"`
 }
 
 // AccumulatedProfitReport For accumulated profit report output
@@ -362,7 +363,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		alphaNrr := fixedpoint.NewFromFloat(s.nrr.RankedValues.Index(1))
 
 		// alpha-weighted inventory and cash
-		targetBase := s.calculatePosition(kline, alphaNrr)
+		targetBase := s.QuantityOrAmount.CalculateQuantity(kline.Close).Mul(alphaNrr)
 		diffQty := targetBase.Sub(s.Position.Base)
 		log.Info(alphaNrr.Float64(), s.Position.Base, diffQty.Float64())
 
@@ -411,75 +412,114 @@ func (s *Strategy) CalcAssetValue(price fixedpoint.Value) fixedpoint.Value {
 	return balances[s.Market.BaseCurrency].Total().Mul(price).Add(balances[s.Market.QuoteCurrency].Total())
 }
 
+// 添加趋势类型
+type Trend string
+
+const (
+	UpTrend      Trend = "uptrend"
+	DownTrend    Trend = "downtrend"
+	NeutralTrend Trend = "neutral"
+)
+
+// 添加 detectTrend 方法
+func (s *Strategy) detectTrend(kline types.KLine) Trend {
+	// 使用 NRR 指标判断趋势
+	nrrValue := s.nrr.RankedValues.Last(0)
+
+	if nrrValue > 0.6 {
+		return UpTrend
+	} else if nrrValue < 0.4 {
+		return DownTrend
+	}
+
+	return NeutralTrend
+}
+
+// 修改 calculatePositionSize 方法
+func (s *Strategy) calculatePositionSize(signal fixedpoint.Value, price fixedpoint.Value) fixedpoint.Value {
+	if !s.PositionScaling {
+		return s.QuantityOrAmount.CalculateQuantity(price)
+	}
+
+	// 根据信号强度调整仓位大小
+	strength := signal.Abs()
+	return s.MaxPositionSize.Mul(strength)
+}
+
+// 修改 placeOrders 方法中的买卖逻辑
 func (s *Strategy) placeOrders(ctx context.Context, diffQty fixedpoint.Value, kline types.KLine) {
-	// 根据市场深度动态调整价差
-	orderBook := s.session.MarketDataStream.GetBook()
-	spread := calculateDynamicSpread(orderBook)
+	// 检查是否需要止损
+	if !s.Position.IsClosed() {
+		roi := s.Position.ROI(kline.Close)
+		if roi.Compare(s.StopLossPercentage.Neg()) < 0 {
+			s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
+			return
+		}
+	}
+
+	// 检查是否达到盈利目标
+	if !s.Position.IsClosed() {
+		roi := s.Position.ROI(kline.Close)
+		if roi.Compare(s.TakeProfitPercentage) > 0 {
+			s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
+			return
+		}
+	}
+
+	// 添加趋势判断
+	trend := s.detectTrend(kline)
 
 	if diffQty.Sign() > 0 {
-		// 分批买入，避免冲击市场
-		chunks := splitOrderIntoChunks(diffQty, 3) // 将订单分成3份
-		for _, qty := range chunks {
-			bidPrice := kline.Close.Mul(fixedpoint.One.Sub(spread))
-			// ... 下单逻辑
+		// 只在上升趋势买入
+		if trend != DownTrend {
+			// 计算动态价差
+			spread := s.calculateDynamicSpread(kline)
+			// 计算买入价格
+			currentPrice := kline.Close
+			bidPrice := currentPrice.Mul(fixedpoint.One.Sub(spread))
+
+			// 计算仓位大小
+			quantity := s.calculatePositionSize(diffQty, currentPrice)
+
+			_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+				Symbol:   s.Symbol,
+				Side:     types.SideTypeBuy,
+				Type:     types.OrderTypeLimitMaker,
+				Quantity: quantity,
+				Price:    bidPrice,
+				Tag:      "irrBuy",
+			})
 		}
 	} else if diffQty.Sign() < 0 {
-		// 分批卖出
-		chunks := splitOrderIntoChunks(diffQty.Abs(), 3)
-		for _, qty := range chunks {
-			askPrice := kline.Close.Mul(fixedpoint.One.Add(spread))
-			// ... 下单逻辑
+		// 只在下降趋势卖出
+		if trend != UpTrend {
+			// 计算动态价差
+			spread := s.calculateDynamicSpread(kline)
+			// 计算卖出价格
+			currentPrice := kline.Close
+			askPrice := currentPrice.Mul(fixedpoint.One.Add(spread))
+
+			// 计算仓位大小
+			quantity := s.calculatePositionSize(diffQty.Abs(), currentPrice)
+
+			_, _ = s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+				Symbol:   s.Symbol,
+				Side:     types.SideTypeSell,
+				Type:     types.OrderTypeLimitMaker,
+				Quantity: quantity,
+				Price:    askPrice,
+				Tag:      "irrSell",
+			})
 		}
 	}
 }
 
-func (s *Strategy) calculatePosition(kline types.KLine, alphaNrr fixedpoint.Value) fixedpoint.Value {
-	// 基础仓位
-	basePosition := s.QuantityOrAmount.CalculateQuantity(kline.Close)
-
-	// 根据趋势强度调整仓位
-	trendStrength := calculateTrendStrength() // 计算趋势强度
-
-	// 根据波动率调整仓位
-	volatility := calculateVolatility() // 计算波动率
-
-	// 动态调整最终仓位
-	targetBase := basePosition.Mul(alphaNrr).
-		Mul(fixedpoint.NewFromFloat(trendStrength)).
-		Mul(fixedpoint.NewFromFloat(volatility))
-
-	return targetBase
-}
-
-func (s *Strategy) checkStopPrice(ctx context.Context, currentPrice fixedpoint.Value) {
-	if s.Position.IsLong() {
-		// 止损价格
-		stopPrice := s.Position.AverageCost.Mul(fixedpoint.One.Sub(s.StopLoss))
-		if currentPrice.Compare(stopPrice) <= 0 {
-			_ = s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
-			return
-		}
-
-		// 止盈价格
-		profitPrice := s.Position.AverageCost.Mul(fixedpoint.One.Add(s.TakeProfit))
-		if currentPrice.Compare(profitPrice) >= 0 {
-			_ = s.orderExecutor.ClosePosition(ctx, fixedpoint.One)
-			return
-		}
-	}
-	// 做空方向类似...
-}
-
-func (s *Strategy) checkRiskLimits() bool {
-	// 检查回撤
-	if s.calculateDrawdown() > s.MaxDrawdown {
-		return false
+func (s *Strategy) calculateDynamicSpread(kline types.KLine) fixedpoint.Value {
+	if !s.VolatilityAdjustment {
+		return s.BidSpread
 	}
 
-	// 检查每日亏损
-	if s.calculateDailyPnL() < s.DailyLossLimit.Neg() {
-		return false
-	}
-
-	return true
+	volatility := (kline.High.Sub(kline.Low)).Div(kline.Close)
+	spread := s.MinSpread.Add(volatility.Mul(fixedpoint.NewFromFloat(0.5)))
+	return fixedpoint.Min(spread, s.MaxSpread)
 }

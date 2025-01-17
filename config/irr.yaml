@@ -15,25 +15,28 @@ exchangeStrategies:
   - on: binance
     irr:
       symbol: BTCUSDT
-      interval: 1m
-      window: 10
+      interval: 5m
+      window: 12
       amount: 5000
 
-      # 限价单价差设置
-      bidSpread: 0.0001 # 买入价差 0.01%
-      askSpread: 0.0001 # 卖出价差 0.01%
+      # 基础价差设置
+      bidSpread: 0.0001 # 默认买入价差 0.01%
+      askSpread: 0.0001 # 默认卖出价差 0.01%
 
-      # 止盈止损设置
-      stopLoss: 0.02 # 止损比例 2%
-      takeProfit: 0.03 # 止盈比例 3%
-      trailingStop: true # 启用追踪止损
+      # 动态价差设置
+      volatilityAdjustment: true # 启用波动率调整价差
+      minSpread: 0.0001 # 最小价差 0.01%
+      maxSpread: 0.002 # 最大价差 0.2%
 
-      # 风险管理参数
-      maxDrawdown: 0.1 # 最大回撤限制 10%
-      dailyLossLimit: 0.05 # 每日亏损限制 5%
-      positionSizeLimit: 0.5 # 最大仓位限制 50%
+      # 仓位管理
+      maxPositionSize: 0.1 # 最大仓位比例 10%
+      positionScaling: true # 启用仓位缩放
 
-      # 绘图设置
+      # 风险控制
+      stopLossPercentage: 0.02 # 止损比例 2%
+      takeProfitPercentage: 0.03 # 止盈比例 3%
+
+      # 回测绘图设置
       drawGraph: true
       graphPNLPath: "./pnl.png"
       graphCumPNLPath: "./cumpnl.png"
